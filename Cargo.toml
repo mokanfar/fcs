@@ -1,0 +1,19 @@
+[package]
+name = "mac-tui-fm"
+version = "0.1.0"
+edition = "2021"
+description = "macOS Modal TUI File Manager inspired by Neovim"
+
+[[bin]]
+name = "mac-tui-fm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "5"
+futures = "0.3"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }

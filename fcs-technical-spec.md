@@ -58,7 +58,7 @@ The keybinding engine supports single keys, modifier combinations (`cmd + f`, `c
       "e": "action.edit",
       "b": "action.bucket",
       "o": "submenu.open",
-      "pa": "action.paste",
+      "p": "action.paste",
       "h": "nav.home"
     }
   }
@@ -118,6 +118,7 @@ Upon launch, the application opens into a command palette style interface showin
 * `d` (**Find Directory**): Filters strictly for directory paths.  
 * `c` (**Find Content**): Prompts for directory scope selection from `settings.search_roots` (`1`–`9` to select an individual directory, or `0` to search within **all** specified directories). Once a scope is chosen, it waits for at least 3 characters of input before executing `ripgrep` (`rg`) with `fzf` to fuzzy-search file contents within that scope. Search results are displayed in a split layout with a **preview pane visible to the right of the results pane**.
   * **Results Navigation**: Strictly `Up`/`Down` arrow keys + `Enter` to select a single file (no `1`–`9` result pickers and no `Space` multi-selection across any fuzzy search mode: `f`, `d`, `c`, `p`).
+  * **Path Truncation**: In the file/results pane, any file path longer than **40 characters** must be middle-truncated with `...`—preserving the leading root segments and trailing path segments (e.g., `/Users/dan/.../code/asdf/`).
   * **Preview Pane Controls**: `1` (press/hold) smooth-scrolls up, `2` (press/hold) smooth-scrolls down, `t` jumps to top, `b` jumps to bottom.  
 * `r` (**Recents**): From the global Home Screen, displays up to 9 in-memory session history entries (`1`–`9`). When invoked inside a **Project Scope**, lists up to **9 most recently modified entries** within that project (sorted by last-modified timestamp, fuzzy-filterable via `fzf`, quick-selectable via `1`–`9`).  
 * `p` (**Projects**): Fuzzy-searches the configured project list in `projects.json`. Selecting a project sets the active directory scope to that project root and re-displays the command menu (`f`, `d`, `c`, `r`, `p`, `h`) scoped to that project.  
@@ -133,10 +134,10 @@ Active File Context: /Users/dev/Projects/engine/src/main.rs
 │ ACTION MENU                                                            │
 ├────────────────────────────────────────────────────────────────────────┤
 │  [m] Move        [c] Copy Menu      [x] Cut          [e] Edit          │
-│  [b] Bucket      [o] Open Menu      [pa] Paste*      [h] Home          │
+│  [b] Bucket      [o] Open Menu      [p] Paste*       [h] Home          │
 └────────────────────────────────────────────────────────────────────────┘
 ```
-*\*Note: `[pa] Paste` is only shown when the active context is a **directory** (omitted when the active context is a file).*
+*\*Note: `[p] Paste` is only shown when the active context is a **directory** (omitted when the active context is a file).*
 
 ## **Action Mapping Table**
 
@@ -148,7 +149,7 @@ Active File Context: /Users/dev/Projects/engine/src/main.rs
 | `e` | **Edit** | Opens the active file in the configured editor (default: Sublime Text / `subl`, configurable via `settings.editor` in JSON). |
 | `b` | **Bucket** | Adds/stages the active file context into the session Bucket (deduplicating if already present) and returns to the Main Menu (Home Screen). |
 | `o` | **Open Submenu** | Opens submenu: `(f)` **File** or `(d)` **Directory** (opens containing folder). |
-| `pa` | **Paste** | Pastes current clipboard contents or pending cut/copy file context (shown only when active context is a directory). |
+| `p` | **Paste** | Pastes current clipboard contents or pending cut/copy file context (shown only when active context is a directory). |
 | `h` | **Home** | Clears active context and returns to the Home Screen. |
 
 ## **Nested Submenu Specifications**
@@ -264,7 +265,7 @@ mac-tui-file-manager/
 - [ ] **Phase 5: Context State & Action Submenus**  
   - [ ] Build `ActiveFileContext` tracking inside `src/app.rs`.  
   - [ ] Implement submenus: **Copy Menu** (`c`), **Open Menu** (`o`), and **Path Menu** (`dir`).  
-  - [ ] Implement basic filesystem operations (`m` Move, `x` Cut, `pa` Paste).  
+  - [ ] Implement basic filesystem operations (`m` Move, `x` Cut, `p` Paste).  
 - [ ] **Phase 6: Native macOS Features Integration**  
   - [ ] Implement binary file copy to macOS system pasteboard for Finder cross-compatibility.  
   - [ ] Implement configurable editor launch (`e`) defaulting to Sublime Text (`subl`).  
@@ -277,4 +278,9 @@ mac-tui-file-manager/
 - [ ] **Phase 8: Rendering & Polish**  
   - [ ] Complete `ratatui` UI layout components in `src/ui.rs` (Home Prompt, Search Overlay, Action Modal, Status Line).  
   - [ ] End-to-end user workflow testing across complex chord combinations and timeout edge cases.
+
+# **8\. Development Workflow & Build Policy**
+
+* **No Automatic Builds After Code Changes**: Do **not** automatically run `make build`, `make install`, or `cargo build --release` after every code edit. The user will trigger builds and installation manually when ready.
+* **Fast Iteration**: During active development, prefer lightweight verification (`cargo check` or targeted `cargo test` when explicitly needed) and leave full binary builds (`cargo run`, `make build`, `make install`) to the user.
 

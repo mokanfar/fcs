@@ -1,0 +1,6 @@
+{
+  "projects": [
+    { "name": "System Engine", "path": "~/Developer/Rust/tui-file-manager" },
+    { "name": "Web Services", "path": "~/Work/Backend/microservices" }
+  ]
+}
