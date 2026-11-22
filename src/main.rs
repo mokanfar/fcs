@@ -50,10 +50,9 @@ async fn main() -> Result<()> {
     let loaded_config = LoadedConfig::load_or_init()?;
     let mut terminal = setup_terminal()?;
 
-    let (timeout_tx, mut timeout_rx) = mpsc::unbounded_channel::<u64>();
     let (async_tx, mut async_rx) = mpsc::unbounded_channel::<AsyncEvent>();
 
-    let mut app = App::new(loaded_config, timeout_tx, async_tx);
+    let mut app = App::new(loaded_config, async_tx);
     let mut events = EventStream::new();
 
     let run_result: Result<()> = async {
@@ -78,9 +77,6 @@ async fn main() -> Result<()> {
                         Some(Err(_)) | None => break,
                         _ => {}
                     }
-                }
-                Some(gen) = timeout_rx.recv() => {
-                    app.handle_chord_timeout(gen);
                 }
                 Some(async_ev) = async_rx.recv() => {
                     app.handle_async_event(async_ev);

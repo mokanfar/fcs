@@ -1,6 +1,5 @@
 {
   "settings": {
-    "chord_timeout_ms": 1000,
     "show_hidden_files": false,
     "editor": "subl",
     "search_roots": ["~/Desktop", "~/Downloads", "~/Documents"]
@@ -11,6 +10,7 @@
       "d": "search.find_directory",
       "c": "search.find_content",
       "r": "search.recents",
+      "h": "search.history",
       "p": "search.projects",
       "b": "bucket.open"
     },

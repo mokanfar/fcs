@@ -1,4 +1,4 @@
-use crate::app::{App, AppMode, BucketSubmenu, RecentsState, SearchKind, SearchState};
+use crate::app::{App, AppMode, BucketSubmenu, HistoryState, SearchKind, SearchState};
 use crate::config::resolve_target_dir;
 use crate::search::truncate_path_middle;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -23,7 +23,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         AppMode::Home => draw_home(frame, app, main_area),
         AppMode::ContentScopeSelect => draw_content_scope(frame, app, main_area),
         AppMode::Search(st) => draw_search(frame, app, st, main_area),
-        AppMode::Recents(st) => draw_recents(frame, app, st, main_area),
+        AppMode::History(st) => draw_history(frame, st, main_area),
         AppMode::FileNotFoundPrompt { path } => draw_file_not_found(frame, path, main_area),
         AppMode::ActionMenu => draw_action_menu(frame, app, main_area),
         AppMode::CopySubmenu => draw_copy_submenu(frame, app, main_area),
@@ -40,25 +40,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     let title = match &app.active_project {
         Some(proj) => format!(
-            " macOS Modal TUI File Manager v0.1.0  |  Project: {} ({}) ",
+            " File Scout Context v0.1.0  |  Project: {} ({}) ",
             proj.name, proj.path
         ),
-        None => " macOS Modal TUI File Manager v0.1.0 ".to_string(),
+        None => " File Context Scout v0.1.0 ".to_string(),
     };
 
     let bucket_hint = if app.bucket.is_empty() {
-        "Open the session Bucket staging workspace".to_string()
+        "Open the persistent Bucket staging workspace".to_string()
     } else {
         format!(
-            "Open the session Bucket staging workspace ({} staged)",
+            "Open the persistent Bucket staging workspace ({} staged)",
             app.bucket.len()
         )
     };
 
     let recents_hint = if app.active_project.is_some() {
-        "Browse 9 most recently modified files in project (fzf)"
+        "Search recently modified files in project (newest first)"
     } else {
-        "Browse session file history (1-9)"
+        "Search recently modified files in search_roots (newest first)"
     };
 
     let mut lines = vec![
@@ -67,21 +67,19 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         menu_row("d", "Find Directory", "Fuzzy search system directories"),
         menu_row("c", "Find Content", "Fuzzy search file contents via rg + fzf"),
         menu_row("r", "Recents", recents_hint),
+        menu_row("h", "History", "Browse persistent file history (1-9)"),
         menu_row("p", "Projects", "Search strictly within configured roots"),
         menu_row("b", "Bucket", &bucket_hint),
     ];
 
-    if app.active_project.is_some() {
-        lines.push(menu_row(
-            "h",
-            "Home",
-            "Clear project scope and return to global menu",
-        ));
-    }
-
     lines.push(Line::from(""));
+    let footer = if app.active_project.is_some() {
+        "   [Esc] Clear Project Scope   [q] Quit   [Ctrl+C] Exit"
+    } else {
+        "   [q] Quit   [Ctrl+C] Exit"
+    };
     lines.push(Line::from(Span::styled(
-        "   [q] Quit   [Ctrl+C] Exit",
+        footer,
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -174,6 +172,10 @@ fn draw_search(frame: &mut Frame, app: &App, st: &SearchState, area: Rect) {
         SearchKind::FindContent { .. } => (
             " Find Content (rg + fzf, min 3 chars) ".to_string(),
             " [↑/↓] Navigate  [Enter] Select  [Tab] Preview Mode ([1]↑ [2]↓ [t]Top [b]Bot) ",
+        ),
+        SearchKind::Recents => (
+            " Recents — Last Modified (Newest First, fzf) ".to_string(),
+            " [↑/↓] Navigate  [Enter] Select  [Tab] Preview Controls  [Esc] Back ",
         ),
         SearchKind::Projects => (
             " Projects (projects.json + fzf) ".to_string(),
@@ -377,54 +379,15 @@ fn draw_search(frame: &mut Frame, app: &App, st: &SearchState, area: Rect) {
     frame.render_widget(preview_widget, preview_area);
 }
 
-fn draw_recents(frame: &mut Frame, app: &App, st: &RecentsState, area: Rect) {
-    let title = if st.project_scoped {
-        let proj_name = app
-            .active_project
-            .as_ref()
-            .map(|p| p.name.as_str())
-            .unwrap_or("Project");
-        format!(" Recents — {} (Most Recently Modified, 1-9) ", proj_name)
-    } else {
-        " Session Recents (1-9) ".to_string()
-    };
-
-    let list_area = if st.project_scoped {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(5)])
-            .split(area);
-
-        let filter_border = if st.filter_focused {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
-        let filter_box = Paragraph::new(format!("> {}", st.query)).block(
-            Block::default()
-                .title(" Filter via fzf ([/] or [Tab] to toggle filter, [1-9] quick select) ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(filter_border)),
-        );
-        frame.render_widget(filter_box, chunks[0]);
-        chunks[1]
-    } else {
-        area
-    };
-
+fn draw_history(frame: &mut Frame, st: &HistoryState, area: Rect) {
     let mut items = Vec::new();
-    if st.loading {
+    if st.entries.is_empty() {
         items.push(ListItem::new(Span::styled(
-            "  Loading recently modified entries...",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else if st.visible_entries.is_empty() {
-        items.push(ListItem::new(Span::styled(
-            "  No recent entries yet.",
+            "  No history entries yet.",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for (idx, path) in st.visible_entries.iter().enumerate() {
+        for (idx, path) in st.entries.iter().enumerate() {
             let is_cur = idx == st.cursor;
             let exists_tag = if path.exists() { "" } else { " [missing]" };
             let text = format!("  [{}] {}{}", idx + 1, path.display(), exists_tag);
@@ -444,12 +407,12 @@ fn draw_recents(frame: &mut Frame, app: &App, st: &RecentsState, area: Rect) {
 
     let list = List::new(items).block(
         Block::default()
-            .title(title)
+            .title(" History (Persistent, 1-9) ")
             .title_bottom(" [1-9] Quick Select  [↑/↓ + Enter] Select  [Esc] Home ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
-    frame.render_widget(list, list_area);
+    frame.render_widget(list, area);
 }
 
 fn draw_file_not_found(frame: &mut Frame, path: &Path, area: Rect) {
@@ -468,7 +431,7 @@ fn draw_file_not_found(frame: &mut Frame, path: &Path, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "   Press [r] to return to Recents, or [Esc] / any key to return Home.",
+            "   Press [h] for History, [r] for Recents, or [Esc] / any key to return Home.",
             Style::default().fg(Color::Yellow),
         )),
     ];
@@ -580,10 +543,6 @@ fn draw_action_menu(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Quick Chords: [of] Open File  [od] Open Directory  (1s chord disambiguation)",
-            Style::default().fg(Color::DarkGray),
-        )),
         Line::from(add_indicator),
     ];
 
@@ -794,17 +753,6 @@ fn draw_bucket(frame: &mut Frame, app: &App, sub: &BucketSubmenu, area: Rect) {
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let mut parts: Vec<Span> = Vec::new();
-
-    if !app.chord_parser.buffer().is_empty() {
-        parts.push(Span::styled(
-            format!(" CHORD: {}... ", app.chord_parser.buffer()),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        parts.push(Span::raw(" "));
-    }
 
     if let Some(pending) = &app.pending_operation {
         parts.push(Span::styled(

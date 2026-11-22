@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
@@ -178,8 +178,14 @@ pub async fn list_directories(roots: &[PathBuf], show_hidden: bool) -> Result<Ve
     Ok(dirs_out)
 }
 
-/// Filters candidate lines through `fzf --filter` (with `--exact` for strict path matching).
-pub async fn fzf_filter(candidates: &[String], query: &str, exact: bool) -> Result<Vec<String>> {
+/// Filters candidate lines through `fzf --filter` (with `--exact` for strict path matching
+/// and optional `--no-sort` to preserve input ordering such as newest-first mtime order).
+pub async fn fzf_filter(
+    candidates: &[String],
+    query: &str,
+    exact: bool,
+    no_sort: bool,
+) -> Result<Vec<String>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -192,6 +198,9 @@ pub async fn fzf_filter(candidates: &[String], query: &str, exact: bool) -> Resu
     cmd.arg("--filter").arg(trimmed);
     if exact {
         cmd.arg("--exact");
+    }
+    if no_sort {
+        cmd.arg("--no-sort");
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -275,7 +284,7 @@ pub async fn search_content(
     }
 
     // Pipe through fzf for fuzzy ranking
-    let ranked = fzf_filter(&raw_lines, trimmed, false).await?;
+    let ranked = fzf_filter(&raw_lines, trimmed, false, false).await?;
     let lines_to_parse = if ranked.is_empty() { raw_lines } else { ranked };
 
     let mut results = Vec::new();
@@ -298,28 +307,30 @@ pub async fn search_content(
     Ok(results)
 }
 
-/// Returns files in a project root sorted by last-modified timestamp (most recent first).
-pub async fn project_recent_entries(
-    root: &Path,
+/// Returns files under `roots` sorted by last-modified timestamp (newest first).
+pub async fn recent_modified_files(
+    roots: &[PathBuf],
     show_hidden: bool,
 ) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let files = list_files(&[root.to_path_buf()], show_hidden).await?;
-    let mut with_mtime: Vec<(PathBuf, SystemTime)> = files
-        .into_iter()
-        .filter_map(|p| {
-            let mtime = fs::metadata(&p)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            Some((p, mtime))
-        })
-        .collect();
+    let files = list_files(roots, show_hidden).await?;
+    let sorted = tokio::task::spawn_blocking(move || {
+        let mut with_mtime: Vec<(PathBuf, SystemTime)> = files
+            .into_iter()
+            .map(|p| {
+                let mtime = fs::metadata(&p)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                (p, mtime)
+            })
+            .collect();
 
-    with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
-    Ok(with_mtime.into_iter().map(|(p, _)| p).collect())
+        with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
+        with_mtime.into_iter().map(|(p, _)| p).collect::<Vec<PathBuf>>()
+    })
+    .await?;
+
+    Ok(sorted)
 }
 
 #[cfg(test)]
@@ -340,5 +351,34 @@ mod tests {
         assert!(out.starts_with("/Users/dev/"));
         assert!(out.contains("..."));
         assert!(out.ends_with("/code/asdf/"));
+    }
+
+    #[tokio::test]
+    async fn test_recent_modified_files_newest_first() {
+        let base = std::env::temp_dir().join(format!(
+            "mac-tui-fm-recents-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let dir_a = base.join("dir_a");
+        let dir_b = base.join("dir_b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let older = dir_a.join("older.txt");
+        fs::write(&older, "first").unwrap();
+        // Ensure distinct mtime on filesystems with coarse timestamp resolution
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let newer = dir_b.join("newer.txt");
+        fs::write(&newer, "second").unwrap();
+
+        let results = recent_modified_files(&[dir_a, dir_b], false)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], newer);
+        assert_eq!(results[1], older);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -1,15 +1,18 @@
 use crate::actions;
 use crate::bucket::Bucket;
-use crate::config::{expand_tilde, resolve_target_dir, LoadedConfig, ProjectEntry};
-use crate::input::{key_event_to_token, ChordParser, ChordResolution};
+use crate::config::{
+    bucket_path, expand_tilde, history_path, resolve_target_dir, LoadedConfig, ProjectEntry,
+};
+use crate::input::key_event_to_token;
 use crate::search::{self, SearchResult};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-pub const RECENTS_CAPACITY: usize = 9;
+pub const HISTORY_CAPACITY: usize = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingOperation {
@@ -68,6 +71,7 @@ pub enum SearchKind {
     FindFile,
     FindDirectory,
     FindContent { roots: Vec<PathBuf> },
+    Recents,
     Projects,
     StrictDirectoryTarget { intent: TargetDirIntent },
 }
@@ -199,15 +203,9 @@ fn load_preview_lines(path: &Path) -> Vec<String> {
 }
 
 #[derive(Debug, Clone)]
-pub struct RecentsState {
-    pub project_scoped: bool,
-    pub query: String,
-    pub filter_focused: bool,
-    pub all_entries: Vec<PathBuf>,
-    pub visible_entries: Vec<PathBuf>,
+pub struct HistoryState {
+    pub entries: Vec<PathBuf>,
     pub cursor: usize,
-    pub loading: bool,
-    pub gen: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,7 +220,7 @@ pub enum AppMode {
     Home,
     ContentScopeSelect,
     Search(SearchState),
-    Recents(RecentsState),
+    History(HistoryState),
     FileNotFoundPrompt { path: PathBuf },
     ActionMenu,
     CopySubmenu,
@@ -242,29 +240,69 @@ pub enum AsyncEvent {
         gen: u64,
         results: Vec<SearchResult>,
     },
-    ProjectRecentsLoaded {
-        gen: u64,
-        entries: Vec<PathBuf>,
-    },
-    ProjectRecentsFiltered {
-        gen: u64,
-        entries: Vec<PathBuf>,
-    },
 }
 
-/// In-memory ring buffer storing up to 9 recently accessed or mutated paths.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HistoryData {
+    #[serde(default)]
+    entries: Vec<PathBuf>,
+}
+
+/// Persistent ring buffer storing up to 9 recently accessed or mutated paths.
 #[derive(Debug, Default)]
-pub struct SessionRecents {
+pub struct History {
     entries: VecDeque<PathBuf>,
+    storage_path: Option<PathBuf>,
 }
 
-impl SessionRecents {
+impl History {
+    #[cfg(test)]
+    pub fn in_memory() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            storage_path: None,
+        }
+    }
+
+    pub fn load(storage_path: PathBuf) -> Self {
+        let mut entries = VecDeque::new();
+        if let Ok(raw) = fs::read_to_string(&storage_path) {
+            if let Ok(data) = serde_json::from_str::<HistoryData>(&raw) {
+                for path in data.entries.into_iter().take(HISTORY_CAPACITY) {
+                    if !entries.contains(&path) {
+                        entries.push_back(path);
+                    }
+                }
+            }
+        }
+        Self {
+            entries,
+            storage_path: Some(storage_path),
+        }
+    }
+
+    fn save(&self) {
+        let Some(ref path) = self.storage_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let data = HistoryData {
+            entries: self.entries.iter().cloned().collect(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&data) {
+            let _ = fs::write(path, json);
+        }
+    }
+
     pub fn record(&mut self, path: PathBuf) {
         self.entries.retain(|p| p != &path);
         self.entries.push_front(path);
-        while self.entries.len() > RECENTS_CAPACITY {
+        while self.entries.len() > HISTORY_CAPACITY {
             self.entries.pop_back();
         }
+        self.save();
     }
 
     pub fn list(&self) -> Vec<PathBuf> {
@@ -279,22 +317,16 @@ pub struct App {
     pub active_project: Option<ProjectEntry>,
     pub pending_operation: Option<PendingOperation>,
     pub additionally_active: bool,
-    pub recents: SessionRecents,
+    pub history: History,
     pub bucket: Bucket,
     pub status_message: Option<String>,
     pub should_quit: bool,
-    pub chord_parser: ChordParser,
     pub async_tx: mpsc::UnboundedSender<AsyncEvent>,
     next_gen: u64,
 }
 
 impl App {
-    pub fn new(
-        config: LoadedConfig,
-        timeout_tx: mpsc::UnboundedSender<u64>,
-        async_tx: mpsc::UnboundedSender<AsyncEvent>,
-    ) -> Self {
-        let timeout_ms = config.app.settings.chord_timeout_ms;
+    pub fn new(config: LoadedConfig, async_tx: mpsc::UnboundedSender<AsyncEvent>) -> Self {
         Self {
             config,
             mode: AppMode::Home,
@@ -302,11 +334,31 @@ impl App {
             active_project: None,
             pending_operation: None,
             additionally_active: false,
-            recents: SessionRecents::default(),
+            history: History::load(history_path()),
+            bucket: Bucket::load(bucket_path()),
+            status_message: None,
+            should_quit: false,
+            async_tx,
+            next_gen: 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_in_memory(
+        config: LoadedConfig,
+        async_tx: mpsc::UnboundedSender<AsyncEvent>,
+    ) -> Self {
+        Self {
+            config,
+            mode: AppMode::Home,
+            active_context: None,
+            active_project: None,
+            pending_operation: None,
+            additionally_active: false,
+            history: History::in_memory(),
             bucket: Bucket::new(),
             status_message: None,
             should_quit: false,
-            chord_parser: ChordParser::new(timeout_ms, timeout_tx),
             async_tx,
             next_gen: 1,
         }
@@ -332,13 +384,6 @@ impl App {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
-    }
-
-    /// Handles a chord timeout event from the Tokio timer.
-    pub fn handle_chord_timeout(&mut self, gen: u64) {
-        if let Some(cmd) = self.chord_parser.on_timeout(gen) {
-            self.execute_command(&cmd);
-        }
     }
 
     /// Handles asynchronous search/listing results.
@@ -374,25 +419,6 @@ impl App {
                     }
                 }
             }
-            AsyncEvent::ProjectRecentsLoaded { gen, entries } => {
-                if let AppMode::Recents(ref mut st) = self.mode {
-                    if st.gen == gen {
-                        st.visible_entries = entries.iter().take(RECENTS_CAPACITY).cloned().collect();
-                        st.all_entries = entries;
-                        st.cursor = 0;
-                        st.loading = false;
-                    }
-                }
-            }
-            AsyncEvent::ProjectRecentsFiltered { gen, entries } => {
-                if let AppMode::Recents(ref mut st) = self.mode {
-                    if st.gen == gen {
-                        st.visible_entries = entries.into_iter().take(RECENTS_CAPACITY).collect();
-                        st.cursor = 0;
-                        st.loading = false;
-                    }
-                }
-            }
         }
     }
 
@@ -408,7 +434,7 @@ impl App {
             AppMode::Home => self.handle_key_home(key),
             AppMode::ContentScopeSelect => self.handle_key_content_scope(key),
             AppMode::Search(_) => self.handle_key_search(key),
-            AppMode::Recents(_) => self.handle_key_recents(key),
+            AppMode::History(_) => self.handle_key_history(key),
             AppMode::FileNotFoundPrompt { .. } => self.handle_key_file_not_found(key),
             AppMode::ActionMenu => self.handle_key_action_menu(key),
             AppMode::CopySubmenu => self.handle_key_copy_submenu(key),
@@ -425,7 +451,6 @@ impl App {
                 return;
             }
             KeyCode::Esc => {
-                self.chord_parser.clear();
                 if self.active_project.is_some() {
                     self.active_project = None;
                     self.set_status("Cleared project scope — back to global Home");
@@ -435,17 +460,16 @@ impl App {
             _ => {}
         }
 
-        let mut bindings = self.config.app.keybindings.home_screen.clone();
-        if self.active_project.is_some() {
-            bindings.insert("h".into(), "nav.clear_project".into());
-        }
-
         if let Some(token) = key_event_to_token(key) {
-            let resolutions = self.chord_parser.feed(&token, &bindings);
-            for res in resolutions {
-                if let ChordResolution::Exact(cmd) = res {
-                    self.execute_command(&cmd);
-                }
+            if let Some(cmd) = self
+                .config
+                .app
+                .keybindings
+                .home_screen
+                .get(&token)
+                .cloned()
+            {
+                self.execute_command(&cmd);
             }
         }
     }
@@ -609,7 +633,10 @@ impl App {
                     self.set_status(format!("Project scope set to: {}", name));
                 }
             }
-            SearchKind::FindFile | SearchKind::FindDirectory | SearchKind::FindContent { .. } => {
+            SearchKind::FindFile
+            | SearchKind::FindDirectory
+            | SearchKind::FindContent { .. }
+            | SearchKind::Recents => {
                 if let Some(res) = state.selected_result() {
                     let path = res.path.clone();
                     self.select_active_context(path);
@@ -648,8 +675,8 @@ impl App {
         match result {
             Ok(dest) => {
                 // Record both original source path and resulting destination path as distinct entries
-                self.recents.record(src.clone());
-                self.recents.record(dest.clone());
+                self.history.record(src.clone());
+                self.history.record(dest.clone());
                 self.pending_operation = None;
                 let verb = match intent {
                     TargetDirIntent::Move => "Moved",
@@ -667,103 +694,59 @@ impl App {
         }
     }
 
-    fn handle_key_recents(&mut self, key: KeyEvent) {
-        let is_project_scoped = matches!(&self.mode, AppMode::Recents(r) if r.project_scoped);
-        let filter_focused = matches!(&self.mode, AppMode::Recents(r) if r.filter_focused);
-
+    fn handle_key_history(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                if filter_focused {
-                    if let AppMode::Recents(ref mut st) = self.mode {
-                        st.filter_focused = false;
-                    }
-                } else {
-                    self.mode = AppMode::Home;
-                }
-                return;
-            }
-            KeyCode::Tab if is_project_scoped => {
-                if let AppMode::Recents(ref mut st) = self.mode {
-                    st.filter_focused = !st.filter_focused;
-                }
-                return;
-            }
-            KeyCode::Char('/') if is_project_scoped && !filter_focused => {
-                if let AppMode::Recents(ref mut st) = self.mode {
-                    st.filter_focused = true;
-                }
+                self.mode = AppMode::Home;
                 return;
             }
             KeyCode::Up => {
-                if let AppMode::Recents(ref mut st) = self.mode {
-                    if !st.visible_entries.is_empty() {
+                if let AppMode::History(ref mut st) = self.mode {
+                    if !st.entries.is_empty() {
                         if st.cursor > 0 {
                             st.cursor -= 1;
                         } else {
-                            st.cursor = st.visible_entries.len() - 1;
+                            st.cursor = st.entries.len() - 1;
                         }
                     }
                 }
                 return;
             }
             KeyCode::Down => {
-                if let AppMode::Recents(ref mut st) = self.mode {
-                    if !st.visible_entries.is_empty() {
-                        st.cursor = (st.cursor + 1) % st.visible_entries.len();
+                if let AppMode::History(ref mut st) = self.mode {
+                    if !st.entries.is_empty() {
+                        st.cursor = (st.cursor + 1) % st.entries.len();
                     }
                 }
                 return;
             }
             KeyCode::Enter => {
                 let chosen = match &self.mode {
-                    AppMode::Recents(st) => st.visible_entries.get(st.cursor).cloned(),
+                    AppMode::History(st) => st.entries.get(st.cursor).cloned(),
                     _ => None,
                 };
                 if let Some(p) = chosen {
-                    self.open_recent_entry(p);
+                    self.open_history_entry(p);
                 }
                 return;
             }
             _ => {}
         }
 
-        // If typing in project-scoped fuzzy filter
-        if is_project_scoped && filter_focused {
-            let mut changed = false;
-            if let AppMode::Recents(ref mut st) = self.mode {
-                match key.code {
-                    KeyCode::Backspace => {
-                        if st.query.pop().is_some() {
-                            changed = true;
-                        }
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        st.query.push(c);
-                        changed = true;
-                    }
-                    _ => {}
-                }
-            }
-            if changed {
-                self.spawn_project_recents_filter();
-            }
-            return;
-        }
-
         // Quick-select 1..=9
         if let KeyCode::Char(c @ '1'..='9') = key.code {
             let idx = (c as u8 - b'1') as usize;
             let chosen = match &self.mode {
-                AppMode::Recents(st) => st.visible_entries.get(idx).cloned(),
+                AppMode::History(st) => st.entries.get(idx).cloned(),
                 _ => None,
             };
             if let Some(p) = chosen {
-                self.open_recent_entry(p);
+                self.open_history_entry(p);
             }
         }
     }
 
-    fn open_recent_entry(&mut self, path: PathBuf) {
+    fn open_history_entry(&mut self, path: PathBuf) {
         if !path.exists() {
             self.mode = AppMode::FileNotFoundPrompt { path };
         } else {
@@ -773,11 +756,14 @@ impl App {
 
     fn handle_key_file_not_found(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('h') => {
+            KeyCode::Esc => {
                 self.mode = AppMode::Home;
             }
+            KeyCode::Char('h') => {
+                self.open_history();
+            }
             KeyCode::Char('r') => {
-                self.open_recents();
+                self.start_search(SearchKind::Recents);
             }
             _ => {
                 self.mode = AppMode::Home;
@@ -788,7 +774,6 @@ impl App {
     fn handle_key_action_menu(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.chord_parser.clear();
                 self.active_context = None;
                 self.additionally_active = false;
                 self.mode = AppMode::Home;
@@ -796,7 +781,6 @@ impl App {
             }
             // Ctrl+O or Override key when a pending operation exists
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.chord_parser.clear();
                 if let Some(ref mut pending) = self.pending_operation {
                     pending.toggle_override();
                     let label = pending.label();
@@ -823,19 +807,14 @@ impl App {
             bindings.retain(|_, v| v != "action.paste");
         }
 
-        // Add multi-key disambiguated chords for Open (`of`, `od`) demonstrating 1s timeout rule
-        bindings.insert("of".into(), "action.open_file".into());
-        bindings.insert("od".into(), "action.open_dir".into());
-
         // Add `a` for Additionally modifier toggle
-        bindings.entry("a".into()).or_insert_with(|| "modifier.additionally".into());
+        bindings
+            .entry("a".into())
+            .or_insert_with(|| "modifier.additionally".into());
 
         if let Some(token) = key_event_to_token(key) {
-            let resolutions = self.chord_parser.feed(&token, &bindings);
-            for res in resolutions {
-                if let ChordResolution::Exact(cmd) = res {
-                    self.execute_command(&cmd);
-                }
+            if let Some(cmd) = bindings.get(&token).cloned() {
+                self.execute_command(&cmd);
             }
         }
     }
@@ -1122,7 +1101,8 @@ impl App {
                     self.mode = AppMode::ContentScopeSelect;
                 }
             }
-            "search.recents" => self.open_recents(),
+            "search.recents" => self.start_search(SearchKind::Recents),
+            "search.history" => self.open_history(),
             "search.projects" => self.start_search(SearchKind::Projects),
             "bucket.open" => {
                 self.mode = AppMode::Bucket(BucketSubmenu::Main);
@@ -1155,29 +1135,6 @@ impl App {
             }
             "submenu.open" => {
                 self.mode = AppMode::OpenSubmenu;
-            }
-            "action.open_file" => {
-                if let Some(ctx) = self.active_context.clone() {
-                    let editor = self.config.app.settings.editor.clone();
-                    match actions::open_file_smart(&ctx, &editor) {
-                        Ok(()) => {
-                            self.set_status(format!("Opened file: {}", ctx.display()));
-                            self.finish_action();
-                        }
-                        Err(e) => self.set_status(format!("Open file failed: {}", e)),
-                    }
-                }
-            }
-            "action.open_dir" => {
-                if let Some(ctx) = self.active_context.clone() {
-                    match actions::open_directory(&ctx) {
-                        Ok(()) => {
-                            self.set_status("Opened containing directory");
-                            self.finish_action();
-                        }
-                        Err(e) => self.set_status(format!("Open dir failed: {}", e)),
-                    }
-                }
             }
             "action.edit" => {
                 if let Some(ctx) = self.active_context.clone() {
@@ -1237,8 +1194,8 @@ impl App {
             };
             match res {
                 Ok(new_path) => {
-                    self.recents.record(pending.path().to_path_buf());
-                    self.recents.record(new_path.clone());
+                    self.history.record(pending.path().to_path_buf());
+                    self.history.record(new_path.clone());
                     if matches!(pending, PendingOperation::Cut(_)) {
                         self.pending_operation = None;
                     }
@@ -1256,8 +1213,8 @@ impl App {
                     for src in &pb_files {
                         match actions::copy_into_dir(src, &dest_dir) {
                             Ok(new_path) => {
-                                self.recents.record(src.clone());
-                                self.recents.record(new_path.clone());
+                                self.history.record(src.clone());
+                                self.history.record(new_path.clone());
                                 last_dest = Some(new_path);
                                 pasted_count += 1;
                             }
@@ -1289,7 +1246,7 @@ impl App {
                     let dest_file = dest_dir.join("pasted_clipboard.txt");
                     match fs::write(&dest_file, text) {
                         Ok(()) => {
-                            self.recents.record(dest_file.clone());
+                            self.history.record(dest_file.clone());
                             self.set_status(format!(
                                 "Pasted clipboard text to {}",
                                 dest_file.display()
@@ -1317,73 +1274,14 @@ impl App {
     }
 
     fn select_active_context(&mut self, path: PathBuf) {
-        self.recents.record(path.clone());
+        self.history.record(path.clone());
         self.active_context = Some(path);
         self.mode = AppMode::ActionMenu;
     }
 
-    fn open_recents(&mut self) {
-        if let Some(proj) = &self.active_project {
-            let root = expand_tilde(&proj.path);
-            let show_hidden = self.config.app.settings.show_hidden_files;
-            let gen = self.alloc_gen();
-            self.mode = AppMode::Recents(RecentsState {
-                project_scoped: true,
-                query: String::new(),
-                filter_focused: false,
-                all_entries: Vec::new(),
-                visible_entries: Vec::new(),
-                cursor: 0,
-                loading: true,
-                gen,
-            });
-            let tx = self.async_tx.clone();
-            tokio::spawn(async move {
-                let entries = search::project_recent_entries(&root, show_hidden)
-                    .await
-                    .unwrap_or_default();
-                let _ = tx.send(AsyncEvent::ProjectRecentsLoaded { gen, entries });
-            });
-        } else {
-            let entries = self.recents.list();
-            let gen = self.alloc_gen();
-            self.mode = AppMode::Recents(RecentsState {
-                project_scoped: false,
-                query: String::new(),
-                filter_focused: false,
-                all_entries: entries.clone(),
-                visible_entries: entries,
-                cursor: 0,
-                loading: false,
-                gen,
-            });
-        }
-    }
-
-    fn spawn_project_recents_filter(&mut self) {
-        let (gen, query, all_entries) = match &mut self.mode {
-            AppMode::Recents(st) => {
-                let g = self.next_gen;
-                self.next_gen = self.next_gen.wrapping_add(1);
-                st.gen = g;
-                st.loading = true;
-                (g, st.query.clone(), st.all_entries.clone())
-            }
-            _ => return,
-        };
-
-        let tx = self.async_tx.clone();
-        tokio::spawn(async move {
-            let candidates: Vec<String> = all_entries
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            let filtered = search::fzf_filter(&candidates, &query, false)
-                .await
-                .unwrap_or_default();
-            let entries: Vec<PathBuf> = filtered.into_iter().map(PathBuf::from).collect();
-            let _ = tx.send(AsyncEvent::ProjectRecentsFiltered { gen, entries });
-        });
+    fn open_history(&mut self) {
+        let entries = self.history.list();
+        self.mode = AppMode::History(HistoryState { entries, cursor: 0 });
     }
 
     fn start_search(&mut self, kind: SearchKind) {
@@ -1428,6 +1326,31 @@ impl App {
                 self.mode = AppMode::Search(st);
                 tokio::spawn(async move {
                     let files = search::list_files(&roots, show_hidden)
+                        .await
+                        .unwrap_or_default();
+                    let candidates: Vec<String> =
+                        files.iter().map(|p| p.display().to_string()).collect();
+                    let initial_results: Vec<SearchResult> = files
+                        .into_iter()
+                        .take(200)
+                        .map(|p| SearchResult {
+                            path: p,
+                            line_number: None,
+                            snippet: None,
+                            project_name: None,
+                        })
+                        .collect();
+                    let _ = tx.send(AsyncEvent::CandidatesLoaded {
+                        gen,
+                        candidates,
+                        initial_results,
+                    });
+                });
+            }
+            SearchKind::Recents => {
+                self.mode = AppMode::Search(st);
+                tokio::spawn(async move {
+                    let files = search::recent_modified_files(&roots, show_hidden)
                         .await
                         .unwrap_or_default();
                     let candidates: Vec<String> =
@@ -1517,7 +1440,7 @@ impl App {
                     st.loading = true;
                 }
                 tokio::spawn(async move {
-                    let matched = search::fzf_filter(&candidates, &query, false)
+                    let matched = search::fzf_filter(&candidates, &query, false, false)
                         .await
                         .unwrap_or_default();
                     let results: Vec<SearchResult> = matched
@@ -1539,13 +1462,15 @@ impl App {
             }
             SearchKind::FindFile
             | SearchKind::FindDirectory
+            | SearchKind::Recents
             | SearchKind::StrictDirectoryTarget { .. } => {
                 let exact = matches!(kind, SearchKind::StrictDirectoryTarget { .. });
+                let no_sort = matches!(kind, SearchKind::Recents);
                 if let AppMode::Search(ref mut st) = self.mode {
                     st.loading = true;
                 }
                 tokio::spawn(async move {
-                    let matched = search::fzf_filter(&candidates, &query, exact)
+                    let matched = search::fzf_filter(&candidates, &query, exact, no_sort)
                         .await
                         .unwrap_or_default();
                     let results: Vec<SearchResult> = matched
@@ -1569,15 +1494,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_session_recents_ring_buffer() {
-        let mut recents = SessionRecents::default();
+    fn test_history_ring_buffer() {
+        let mut history = History::in_memory();
         for i in 0..12 {
-            recents.record(PathBuf::from(format!("/tmp/file_{}.txt", i)));
+            history.record(PathBuf::from(format!("/tmp/file_{}.txt", i)));
         }
-        let list = recents.list();
+        let list = history.list();
         assert_eq!(list.len(), 9);
         assert_eq!(list[0], PathBuf::from("/tmp/file_11.txt"));
         assert_eq!(list[8], PathBuf::from("/tmp/file_3.txt"));
+    }
+
+    #[test]
+    fn test_history_persists_across_sessions() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "mac-tui-fm-history-persist-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let storage = tmp_dir.join("history.json");
+
+        {
+            let mut history = History::load(storage.clone());
+            history.record(PathBuf::from("/tmp/first.txt"));
+            history.record(PathBuf::from("/tmp/second.txt"));
+        }
+
+        let reloaded = History::load(storage.clone());
+        assert_eq!(
+            reloaded.list(),
+            vec![
+                PathBuf::from("/tmp/second.txt"),
+                PathBuf::from("/tmp/first.txt")
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -1592,13 +1545,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_additionally_preserves_context_and_reopens_action_menu() {
-        let (t_tx, _t_rx) = mpsc::unbounded_channel();
         let (a_tx, _a_rx) = mpsc::unbounded_channel();
         let cfg = LoadedConfig {
             app: Default::default(),
             projects: Default::default(),
         };
-        let mut app = App::new(cfg, t_tx, a_tx);
+        let mut app = App::new_in_memory(cfg, a_tx);
         let path = PathBuf::from("/tmp/example_additionally.txt");
         app.select_active_context(path.clone());
         assert!(matches!(app.mode, AppMode::ActionMenu));
@@ -1615,28 +1567,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_recent_triggers_file_not_found_prompt() {
-        let (t_tx, _t_rx) = mpsc::unbounded_channel();
+    async fn test_missing_history_triggers_file_not_found_prompt() {
         let (a_tx, _a_rx) = mpsc::unbounded_channel();
         let cfg = LoadedConfig {
             app: Default::default(),
             projects: Default::default(),
         };
-        let mut app = App::new(cfg, t_tx, a_tx);
+        let mut app = App::new_in_memory(cfg, a_tx);
         let missing = PathBuf::from("/tmp/definitely_non_existent_mac_tui_fm_file_99999");
-        app.open_recent_entry(missing.clone());
+        app.open_history_entry(missing.clone());
         assert!(matches!(app.mode, AppMode::FileNotFoundPrompt { ref path } if path == &missing));
     }
 
     #[tokio::test]
-    async fn test_move_creates_missing_dir_and_records_both_recents() {
-        let (t_tx, _t_rx) = mpsc::unbounded_channel();
+    async fn test_home_h_key_opens_history() {
         let (a_tx, _a_rx) = mpsc::unbounded_channel();
         let cfg = LoadedConfig {
             app: Default::default(),
             projects: Default::default(),
         };
-        let mut app = App::new(cfg, t_tx, a_tx);
+        let mut app = App::new_in_memory(cfg, a_tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, AppMode::History(_)));
+    }
+
+    #[tokio::test]
+    async fn test_move_creates_missing_dir_and_records_both_history() {
+        let (a_tx, _a_rx) = mpsc::unbounded_channel();
+        let cfg = LoadedConfig {
+            app: Default::default(),
+            projects: Default::default(),
+        };
+        let mut app = App::new_in_memory(cfg, a_tx);
 
         let base = std::env::temp_dir().join(format!("mac-tui-fm-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
@@ -1652,9 +1614,9 @@ mod tests {
         assert!(dest.exists());
         assert!(!src.exists());
 
-        let recents = app.recents.list();
-        assert!(recents.contains(&src));
-        assert!(recents.contains(&dest));
+        let history = app.history.list();
+        assert!(history.contains(&src));
+        assert!(history.contains(&dest));
 
         let _ = fs::remove_dir_all(&base);
     }

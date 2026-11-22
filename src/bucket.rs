@@ -1,7 +1,17 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static BUCKET_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BucketData {
+    #[serde(default)]
+    items: Vec<PathBuf>,
+}
 
 #[derive(Debug)]
 pub struct Bucket {
@@ -9,17 +19,65 @@ pub struct Bucket {
     pub cursor: usize,
     pub selected: HashSet<usize>,
     staging_dir: PathBuf,
+    storage_path: Option<PathBuf>,
 }
 
 impl Bucket {
+    /// Creates an ephemeral in-memory bucket (not persisted to disk).
     pub fn new() -> Self {
-        let staging_dir = std::env::temp_dir().join(format!("mac-tui-fm-bucket-{}", std::process::id()));
+        Self::with_storage(None)
+    }
+
+    /// Loads a persistent bucket from `storage_path` (creating the file on first mutation).
+    pub fn load(storage_path: PathBuf) -> Self {
+        Self::with_storage(Some(storage_path))
+    }
+
+    fn with_storage(storage_path: Option<PathBuf>) -> Self {
+        let seq = BUCKET_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let staging_dir = std::env::temp_dir().join(format!(
+            "mac-tui-fm-bucket-{}-{}",
+            std::process::id(),
+            seq
+        ));
         let _ = fs::create_dir_all(&staging_dir);
-        Self {
+
+        let mut bucket = Self {
             items: Vec::new(),
             cursor: 0,
             selected: HashSet::new(),
             staging_dir,
+            storage_path: storage_path.clone(),
+        };
+
+        if let Some(ref path) = storage_path {
+            if let Ok(raw) = fs::read_to_string(path) {
+                if let Ok(data) = serde_json::from_str::<BucketData>(&raw) {
+                    for item in data.items {
+                        if !bucket.items.iter().any(|p| p == &item) {
+                            bucket.create_staging_link(&item);
+                            bucket.items.push(item);
+                        }
+                    }
+                }
+            }
+        }
+
+        bucket
+    }
+
+    fn save(&self) {
+        let Some(ref path) = self.storage_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let data = BucketData {
+            items: self.items.clone(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&data) {
+            let _ = fs::write(path, json);
         }
     }
 
@@ -44,6 +102,7 @@ impl Bucket {
         }
         self.create_staging_link(&canonical);
         self.items.push(canonical);
+        self.save();
         true
     }
 
@@ -125,12 +184,13 @@ impl Bucket {
         }
     }
 
-    /// Clears all items from the bucket and removes staged symlinks.
+    /// Clears all items from the bucket, removes staged symlinks, and updates persisted state.
     pub fn archive(&mut self) {
         self.items.clear();
         self.selected.clear();
         self.cursor = 0;
         self.clean_staging_dir();
+        self.save();
     }
 
     fn clean_staging_dir(&self) {
@@ -180,5 +240,45 @@ mod tests {
 
         bucket.archive();
         assert!(bucket.is_empty());
+    }
+
+    #[test]
+    fn test_bucket_persists_across_sessions() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "mac-tui-fm-bucket-persist-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let storage = tmp_dir.join("bucket.json");
+
+        {
+            let mut bucket = Bucket::load(storage.clone());
+            assert!(bucket.add(PathBuf::from("/tmp/persist_a.txt")));
+            assert!(bucket.add(PathBuf::from("/tmp/persist_b.txt")));
+            assert_eq!(bucket.len(), 2);
+        }
+
+        // Reload in a new "session"
+        {
+            let mut reloaded = Bucket::load(storage.clone());
+            assert_eq!(
+                reloaded.items,
+                vec![
+                    PathBuf::from("/tmp/persist_a.txt"),
+                    PathBuf::from("/tmp/persist_b.txt")
+                ]
+            );
+            reloaded.archive();
+            assert!(reloaded.is_empty());
+        }
+
+        // Reload after archive -> should remain empty
+        {
+            let after_archive = Bucket::load(storage.clone());
+            assert!(after_archive.is_empty());
+        }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

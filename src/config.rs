@@ -9,18 +9,12 @@ const DEFAULT_PROJECTS_JSON: &str = include_str!("../config/projects.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    #[serde(default = "default_chord_timeout_ms")]
-    pub chord_timeout_ms: u64,
     #[serde(default)]
     pub show_hidden_files: bool,
     #[serde(default = "default_editor")]
     pub editor: String,
     #[serde(default = "default_search_roots")]
     pub search_roots: Vec<String>,
-}
-
-fn default_chord_timeout_ms() -> u64 {
-    1000
 }
 
 fn default_editor() -> String {
@@ -38,7 +32,6 @@ fn default_search_roots() -> Vec<String> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            chord_timeout_ms: default_chord_timeout_ms(),
             show_hidden_files: false,
             editor: default_editor(),
             search_roots: default_search_roots(),
@@ -60,6 +53,7 @@ fn default_home_screen_bindings() -> HashMap<String, String> {
     map.insert("d".into(), "search.find_directory".into());
     map.insert("c".into(), "search.find_content".into());
     map.insert("r".into(), "search.recents".into());
+    map.insert("h".into(), "search.history".into());
     map.insert("p".into(), "search.projects".into());
     map.insert("b".into(), "bucket.open".into());
     map
@@ -130,10 +124,22 @@ impl LoadedConfig {
             let _ = fs::write(&projects_path, DEFAULT_PROJECTS_JSON);
         }
 
-        let app = fs::read_to_string(&kb_path)
+        let mut app = fs::read_to_string(&kb_path)
             .ok()
             .and_then(|s| serde_json::from_str::<AppConfig>(&s).ok())
             .unwrap_or_default();
+
+        // Ensure existing configs from older versions still get `h` -> `search.history`
+        let has_history_cmd = app
+            .keybindings
+            .home_screen
+            .values()
+            .any(|v| v == "search.history");
+        if !has_history_cmd && !app.keybindings.home_screen.contains_key("h") {
+            app.keybindings
+                .home_screen
+                .insert("h".into(), "search.history".into());
+        }
 
         let projects = fs::read_to_string(&projects_path)
             .ok()
@@ -160,6 +166,14 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("mac-tui-fm")
+}
+
+pub fn history_path() -> PathBuf {
+    config_dir().join("history.json")
+}
+
+pub fn bucket_path() -> PathBuf {
+    config_dir().join("bucket.json")
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -214,12 +228,15 @@ mod tests {
     #[test]
     fn test_default_config_parses() {
         let app: AppConfig = serde_json::from_str(DEFAULT_KEYBINDINGS_JSON).unwrap();
-        assert_eq!(app.settings.chord_timeout_ms, 1000);
         assert_eq!(app.settings.editor, "subl");
         assert_eq!(app.settings.search_roots.len(), 3);
         assert_eq!(
             app.keybindings.home_screen.get("f").map(String::as_str),
             Some("search.find_file")
+        );
+        assert_eq!(
+            app.keybindings.home_screen.get("h").map(String::as_str),
+            Some("search.history")
         );
         assert_eq!(
             app.keybindings.action_menu.get("p").map(String::as_str),

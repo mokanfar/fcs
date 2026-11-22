@@ -364,19 +364,19 @@ pub fn open_with_default_app(paths: &[PathBuf]) -> Result<()> {
 }
 
 pub fn open_directory(path: &Path) -> Result<()> {
-    let dir = if path.is_dir() {
-        path
+    if path.is_dir() {
+        Command::new("open")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to open directory")?;
+        Ok(())
     } else {
-        path.parent().unwrap_or(path)
-    };
-    Command::new("open")
-        .arg(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Failed to open directory")?;
-    Ok(())
+        // Opens the containing folder in Finder with the file highlighted/selected
+        reveal_in_finder(&[path.to_path_buf()])
+    }
 }
 
 pub fn reveal_in_finder(paths: &[PathBuf]) -> Result<()> {
